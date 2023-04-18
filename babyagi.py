@@ -7,6 +7,10 @@ from typing import Dict, List
 import importlib
 
 import openai
+import json
+import redis
+from redisearch import Client, TextField, NumericField, Query
+
 import pinecone
 from dotenv import load_dotenv
 
@@ -99,22 +103,26 @@ print(f"{OBJECTIVE}")
 
 print("\033[93m\033[1m" + "\nInitial task:" + "\033[0m\033[0m" + f" {INITIAL_TASK}")
 
-# Configure OpenAI and Pinecone
+# Configure OpenAI and Redis
 openai.api_key = OPENAI_API_KEY
-pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
 
-# Create Pinecone index
-table_name = YOUR_TABLE_NAME
-dimension = 1536
-metric = "cosine"
-pod_type = "p1"
-if table_name not in pinecone.list_indexes():
-    pinecone.create_index(
-        table_name, dimension=dimension, metric=metric, pod_type=pod_type
-    )
+# Comment out Pinecone-related code
+# pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
+# if table_name not in pinecone.list_indexes():
+#     pinecone.create_index(
+#         table_name, dimension=dimension, metric=metric, pod_type=pod_type
+#     )
+# index = pinecone.Index(table_name)
 
-# Connect to the index
-index = pinecone.Index(table_name)
+# Add Redisearch-related code
+redis_connection = redis.Redis(host='localhost', port=6379, db=0)
+search_client = Client(YOUR_TABLE_NAME, conn=redis_connection)
+
+try:
+    search_client.create_index((TextField('task_name'), TextField('result'), NumericField('embedding', sortable=True)))
+except redis.exceptions.ResponseError:
+    # The index might already exist. You can decide how to handle this situation.
+    pass
 
 # Task list
 task_list = deque([])
@@ -237,6 +245,7 @@ def execution_agent(objective: str, task: str) -> str:
 
 
 def context_agent(query: str, n: int):
+    top_results_num = n
     """
     Retrieves context for a given query from an index of tasks.
 
@@ -248,13 +257,17 @@ def context_agent(query: str, n: int):
         list: A list of tasks as context for the given query, sorted by relevance.
 
     """
-    query_embedding = get_ada_embedding(query)
-    results = index.query(query_embedding, top_k=n, include_metadata=True, namespace=OBJECTIVE)
-    # print("***** RESULTS *****")
-    # print(results)
-    sorted_results = sorted(results.matches, key=lambda x: x.score, reverse=True)
-    return [(str(item.metadata["task"])) for item in sorted_results]
+    # Remove Pinecone-related code
+    # query_embedding = get_ada_embedding(query)
+    # results = index.query(query_embedding, top_k=top_results_num, include_metadata=True, namespace=OBJECTIVE)
+    # sorted_results = sorted(results.matches, key=lambda x: x.score, reverse=True)
+    # return [(str(item.metadata["task"])) for item in sorted_results]
 
+    # Add Redisearch-related code
+    query = Query(query).no_content().with_scores().paging(0, top_results_num)
+    results = search_client.search(query)
+    sorted_results = sorted(results.docs, key=lambda x: x.score, reverse=True)
+    return [(str(search_client.redis.hget(item.id, "task").decode("utf-8")) if search_client.redis.hget(item.id, "task") is not None else "default_value") for item in sorted_results]
 
 # Add the first task
 first_task = {"task_id": 1, "task_name": INITIAL_TASK}
@@ -288,10 +301,15 @@ while True:
         vector = get_ada_embedding(
             enriched_result["data"]
         )  # get vector of the actual result extracted from the dictionary
-        index.upsert(
-            [(result_id, vector, {"task": task["task_name"], "result": result})],
-	    namespace=OBJECTIVE
-        )
+        # Comment out Pinecone-related code
+        # index.upsert(
+        #     [(result_id, vector, {"task": task["task_name"], "result": result})],
+        #     namespace=OBJECTIVE
+        # )
+
+        # Add Redisearch-related code
+        search_client.redis.hset(result_id, mapping={'task_name': task["task_name"], 'result': result})
+        search_client.add_document(result_id, replace=True, task_name=task["task_name"], result=result, embedding=json.dumps(vector))
 
         # Step 3: Create new tasks and reprioritize task list
         new_tasks = task_creation_agent(
